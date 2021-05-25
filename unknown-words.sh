@@ -23,6 +23,37 @@ main() {
       exit 1
       ;;
     push)
+      if [ -n "$INPUT_SUPPRESS_PUSH_FOR_OPEN_PULL_REQUEST" ]; then
+        pull_request_json=$(mktemp_json)
+        pull_heads_query="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/pulls?head=${GITHUB_REPOSITORY%/*}:$GITHUB_REF"
+        curl -s \
+          -H "Authorization: token $GITHUB_TOKEN" \
+          "$pull_heads_query" > $pull_request_json
+        if [ -n "$(jq .documentation_url $pull_request_json 2>/dev/null)" ]; then
+          (
+            echo "Request for '$pull_request_json' appears to have yielded an error, it is probably an authentication error."
+            if [ -n "$ACT" ]; then
+              echo '[act] If you want to use suppress_push_for_open_pull_request, you need to set GITHUB_TOKEN'
+            fi
+            cat $pull_request_json
+            echo 'Cannot determine if there is an open pull request, proceeding as if there is not.'
+          ) >&2
+        elif [ $(jq length $pull_request_json) -gt 0 ]; then
+          (
+            echo "Found open PR #$(jq -r '.[0].number' $pull_request_json) - check-spelling should run there."
+            echo
+            echo 'WARNING: This workflow is intentionally terminating early with a success code -- it has not checked for misspellings.'
+            echo 'You should treat this workflow run as if it were SKIPPED state and instead look for a `pull_request_target` workflow for `check-spelling` in the PR.'
+            if [ -n "$ACT" ]; then
+              echo
+              echo 'You appear to be running nektos/act, you should probably comment out:'
+              echo
+              echo "        suppress_push_for_open_pull_request: $INPUT_SUPPRESS_PUSH_FOR_OPEN_PULL_REQUEST"
+            fi
+          ) >&2
+          exit 0
+        fi
+      fi
       ;;
     pull_request|pull_request_target)
       ;;
