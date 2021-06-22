@@ -1,3 +1,4 @@
+amd
 apps
 bdc
 cbeaff

@@ -228,8 +228,8 @@ handle_comment() {
     quit 0
   fi
 
-  define_variables
   set_up_tools
+  define_variables
   set_up_files
   . "$spellchecker/update-state.sh"
 
@@ -367,7 +367,26 @@ handle_comment() {
   quit 0
 }
 
+yq_inputs() {
+  yq e ".inputs.$1.default" $action_file
+}
+
 define_variables() {
+  if [ -n "$ACT" ]; then
+    action_file=$GITHUB_ACTION_PATH/action.yml
+    if [ -z "$INPUT_CONFIG" ]; then
+      INPUT_CONFIG=$(yq_inputs config)
+    fi
+    if [ -z "$INPUT_DICTIONARY_ALIASES" ]; then
+      INPUT_DICTIONARY_ALIASES=$(yq_inputs dictionary_source_prefixes)
+    fi
+    if [ -z "$INPUT_DICTIONARY_URL" ]; then
+      INPUT_DICTIONARY_URL=$(yq_inputs dictionary_url)
+    fi
+    if [ -z "$INPUT_DICTIONARY_VERSION" ]; then
+      INPUT_DICTIONARY_VERSION=$(yq_inputs dictionary_version)
+    fi
+  fi
   bucket=${INPUT_BUCKET:-$bucket}
   project=${INPUT_PROJECT:-$project}
   if [ -z "$bucket" ] && [ -z "$project" ] && [ -n "$INPUT_CONFIG" ]; then
@@ -606,6 +625,9 @@ download_or_quit_with_error() {
 }
 
 set_up_tools() {
+  spellchecker_bin="$spellchecker/bin"
+  mkdir -p $spellchecker_bin
+  PATH=$spellchecker_bin:$PATH
   apps=""
   add_app() {
     if ! command_v $1; then
@@ -628,18 +650,25 @@ set_up_tools() {
     fi
   fi
   set_up_jq
+  set_up_yq
 }
 
 set_up_jq() {
   if ! command_v jq || jq --version | perl -ne 'exit 0 unless s/^jq-//;exit 1 if /^(?:[2-9]|1\d|1\.(?:[6-9]|1\d+))/; exit 0'; then
     jq_url=https://github.com/stedolan/jq/releases/download/jq-1.6/jq-linux64
-    spellchecker_bin="$spellchecker/bin"
     jq_bin="$spellchecker_bin/jq"
-    mkdir -p $spellchecker_bin
     download_or_quit_with_error "$jq_url" "$jq_bin"
     chmod 0755 "$jq_bin"
-    PATH=$spellchecker_bin:$PATH
   fi
+}
+
+set_up_yq() {
+  yq_binary=yq_linux_amd64
+  yq_version=v4.9.6
+  yq_url="https://github.com/mikefarah/yq/releases/download/${yq_version}/${yq_binary}"
+  yq_bin="$spellchecker_bin/yq"
+  download_or_quit_with_error "$yq_url" "$yq_bin"
+  chmod 0755 "$yq_bin"
 }
 
 words_to_lines() {
@@ -1488,8 +1517,8 @@ $(remove_items)
 
 set_up_reporter
 dispatcher
-define_variables
 set_up_tools
+define_variables
 set_up_files
 . "$spellchecker/update-state.sh"
 welcome
