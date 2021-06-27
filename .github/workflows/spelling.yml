@@ -30,9 +30,40 @@ jobs:
       with:
         ref: ${{ github.event.pull_request.head.sha }}
     - name: check-spelling
+      id: spelling
       uses: ./
       with:
         experimental_apply_changes_via_bot: 1
+    - name: store-comment
+      if: failure()
+      uses: actions/upload-artifact@v2
+      with:
+        name: "check-spelling-comment-${{ github.run_id }}"
+        path: |
+          ${{ steps.spelling.outputs.skipped_files }}
+          ${{ steps.spelling.outputs.stale_words }}
+          ${{ steps.spelling.outputs.unknown_words }}
+          ${{ steps.spelling.outputs.suggested_dictionaries }}
+          ${{ steps.spelling.outputs.warnings }}
+
+  comment:
+    name: Comment
+    runs-on: ubuntu-latest
+    needs: spelling
+    if: always() && needs.spelling.result == 'failure'
+    steps:
+    - name: retrieve-comment
+      uses: actions/download-artifact@v2
+      with:
+        name: "check-spelling-comment-${{ github.run_id }}"
+
+    - name: checkout
+      uses: actions/checkout@v2
+    - name: comment
+      run:
+        cat tokens.txt
+
+
   update:
     name: Update PR
     permissions:
