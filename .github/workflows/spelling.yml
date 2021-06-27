@@ -16,7 +16,6 @@ jobs:
       checks: write
       issues: write
       contents: read
-      metadata: write
     runs-on: ubuntu-latest
     if: "contains(github.event_name, 'pull_request') || github.event_name == 'push'"
     steps:
@@ -40,7 +39,6 @@ jobs:
       checks: write
       issues: write
       contents: write
-      metadata: write
     runs-on: ubuntu-latest
     if: ${{
         github.event_name == 'issue_comment' &&
