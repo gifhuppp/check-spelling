@@ -1413,9 +1413,12 @@ skip_curl() {
   [ -n "$SKIP_CURL" ] || repo_is_private
 }
 
-make_instructions() {
+set_patch_remove_add() {
   patch_remove=$(echo "$diff_output" | perl -ne 'next unless s/^-([^-])/$1/; s/\n/ /; print')
   patch_add=$(echo "$diff_output" | perl -ne 'next unless s/^\+([^+])/$1/; s/\n/ /; print')
+}
+
+make_instructions() {
   if skip_curl; then
     instructions=$(generate_instructions)
     if [ -n "$patch_add" ]; then
@@ -1537,6 +1540,7 @@ if [ -n "$INPUT_REPORT_TITLE_SUFFIX" ]; then
   report_header="$report_header $INPUT_REPORT_TITLE_SUFFIX"
 fi
 fewer_misspellings_canary=$(mktemp)
+set_patch_remove_add
 fewer_misspellings
 more_misspellings
 cat $output_variables
