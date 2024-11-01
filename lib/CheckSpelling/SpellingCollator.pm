@@ -8,11 +8,19 @@ use File::Path qw(remove_tree);
 use CheckSpelling::Util;
 
 my %letter_map;
+my $disable_word_collating;
 
 sub get_field {
   my ($record, $field) = @_;
   return 0 unless $record =~ (/\b$field:\s*(\d+)/);
   return $1;
+}
+
+sub get_array {
+  my ($record, $field) = @_;
+  return () unless $record =~ (/\b$field: \[([^\]]+)\]/);
+  my $values = $1;
+  return split /\s*,\s*/, $values;
 }
 
 sub maybe {
@@ -69,6 +77,56 @@ sub skip_item {
   return 0;
 }
 
+sub log_skip_item {
+  my ($item, $file, $warning, $unknown_word_limit) = @_;
+  return 1 if skip_item($item);
+  my $seen_count = $seen{$item};
+  if (defined $seen_count) {
+    if (!defined $unknown_word_limit || ($seen_count++ < $unknown_word_limit)) {
+      print MORE_WARNINGS "$file$warning\n"
+    } else {
+      $last_seen{$item} = "$file$warning";
+    }
+    $seen{$item} = $seen_count;
+    return 1;
+  }
+  $seen{$item} = 1;
+  return 0;
+}
+
+sub stem_word {
+  my ($key) = @_;
+  our $disable_word_collating;
+  return $key if $disable_word_collating;
+
+  if ($key =~ /.s$/) {
+    if ($key =~ /ies$/) {
+      $key =~ s/ies$/y/;
+    } else {
+      $key =~ s/s$//;
+    }
+  } elsif ($key =~ /.[^aeiou]ed$/) {
+    $key =~ s/ed$//;
+  }
+  return $key;
+}
+
+sub collate_key {
+  my ($key) = @_;
+  our $disable_word_collating;
+  if ($disable_word_collating) {
+    $char = lc substr $key, 0, 1;
+  } else {
+    $key = lc $key;
+    $key =~ s/''+/'/g;
+    $key =~ s/'[sd]$//;
+    $key =~ s/^[^Ii]?'+(.*)/$1/;
+    $key =~ s/(.*?)'$/$1/;
+    $char = substr $key, 0, 1;
+  }
+  return ($key, $char);
+}
+
 sub load_expect {
   my ($expect) = @_;
   our %expected;
@@ -82,6 +140,47 @@ sub load_expect {
   }
 }
 
+sub harmonize_expect {
+  our $disable_word_collating;
+  our %letter_map;
+  our %expected;
+
+  for my $word (keys %expected) {
+    my ($key, $char) = collate_key $word;
+    my %word_map = ();
+    next unless defined $letter_map{$char}{$key};
+    %word_map = %{$letter_map{$char}{$key}};
+    next if defined $word_map{$word};
+    my $words = scalar keys %word_map;
+    next if $words > 2;
+    if ($word eq $key) {
+      next if ($words > 1);
+    }
+    delete $expected{$word};
+  }
+}
+
+sub group_related_words {
+  our %letter_map;
+  our $disable_word_collating;
+  unless ($disable_word_collating) {
+    # group related words
+    for my $char (sort CheckSpelling::Util::number_biased keys %letter_map) {
+      for my $plural_key (sort keys(%{$letter_map{$char}})) {
+        my $key = stem_word $plural_key;
+        next if $key eq $plural_key;
+        next unless defined $letter_map{$char}{$key};
+        my %word_map = %{$letter_map{$char}{$key}};
+        for $word (keys(%{$letter_map{$char}{$plural_key}})) {
+          $word_map{$word} = 1;
+        }
+        $letter_map{$char}{$key} = \%word_map;
+        delete $letter_map{$char}{$plural_key};
+      }
+    }
+  }
+}
+
 sub count_warning {
   my ($warning) = @_;
   our %counters;
@@ -91,11 +190,82 @@ sub count_warning {
   }
 }
 
+sub report_timing {
+  my ($name, $start_time, $directory, $marker) = @_;
+  my $end_time = (stat "$directory/$marker")[9];
+  $name =~ s/"/\\"/g;
+  print TIMING_REPORT "\"$name\", $start_time, $end_time\n";
+}
+
+sub get_pattern_with_context {
+  my ($path) = @_;
+  return unless defined $ENV{$path};
+  $ENV{$path} =~ /(.*)/;
+  return unless open ITEMS, '<:utf8', $1;
+
+  my @items;
+  my $context = '';
+  while (<ITEMS>) {
+    my $pattern = $_;
+    if ($pattern =~ /^#/) {
+      if ($pattern =~ /^# /) {
+        $context .= $pattern;
+      } else {
+        $context = '';
+      }
+      next;
+    }
+    chomp $pattern;
+    unless ($pattern =~ /./) {
+      $context = '';
+      next;
+    }
+    push @items, $context.$pattern;
+    $context = '';
+  }
+  close ITEMS;
+  return @items;
+}
+
+sub summarize_totals {
+  my ($formatter, $path, $items, $totals, $file_counts) = @_;
+  return unless @{$totals};
+  return unless open my $fh, '>:utf8', $path;
+  my $totals_count = scalar(@{$totals}) - 1;
+  my @indices;
+  if ($file_counts) {
+    @indices = sort {
+      $totals->[$b] <=> $totals->[$a] ||
+      $file_counts->[$b] <=> $file_counts->[$a]
+    } 0 .. $totals_count;
+  } else {
+    @indices = sort {
+      $totals->[$b] <=> $totals->[$a]
+    } 0 .. $totals_count;
+  }
+  for my $i (@indices) {
+    last unless $totals->[$i] > 0;
+    my $rule_with_context = $items->[$i];
+    my ($description, $rule);
+    if ($rule_with_context =~ /^(.*\n)([^\n]+)$/s) {
+      ($description, $rule) = ($1, $2);
+    } else {
+      ($description, $rule) = ('', $rule_with_context);
+    }
+    print $fh $formatter->(
+      $totals->[$i],
+      ($file_counts ? " file-count: $file_counts->[$i]" : ""),
+      $description,
+      $rule
+    );
+  }
+  close $fh;
+}
+
 sub main {
   my @directories;
   my @cleanup_directories;
-
-  my %unknown;
+  my @check_file_paths;
 
   my $early_warnings = CheckSpelling::Util::get_file_from_env('early_warnings', '/dev/null');
   my $warning_output = CheckSpelling::Util::get_file_from_env('warning_output', '/dev/stderr');
@@ -103,14 +273,34 @@ sub main {
   my $counter_summary = CheckSpelling::Util::get_file_from_env('counter_summary', '/dev/stderr');
   my $should_exclude_file = CheckSpelling::Util::get_file_from_env('should_exclude_file', '/dev/null');
   my $unknown_word_limit = CheckSpelling::Util::get_val_from_env('unknown_word_limit', undef);
+  my $candidate_example_limit = CheckSpelling::Util::get_file_from_env('INPUT_CANDIDATE_EXAMPLE_LIMIT', '3');
+  my $disable_flags = CheckSpelling::Util::get_file_from_env('INPUT_DISABLE_CHECKS', '');
+  my $disable_noisy_file = $disable_flags =~ /(?:^|,|\s)noisy-file(?:,|\s|$)/;
+  our $disable_word_collating = $disable_flags =~ /(?:^|,|\s)word-collating(?:,|\s|$)/;
+  my $file_list = CheckSpelling::Util::get_file_from_env('check_file_names', '');
+  my $timing_report = CheckSpelling::Util::get_file_from_env('timing_report', '');
+  my ($start_time, $end_time);
 
   open WARNING_OUTPUT, '>:utf8', $warning_output;
   open MORE_WARNINGS, '>:utf8', $more_warnings;
   open COUNTER_SUMMARY, '>:utf8', $counter_summary;
   open SHOULD_EXCLUDE, '>:utf8', $should_exclude_file;
+  if ($timing_report) {
+    open TIMING_REPORT, '>:utf8', $timing_report;
+    print TIMING_REPORT "file, start, finish\n";
+  }
+
+  my @candidates = get_pattern_with_context('candidates_path');
+  my @candidate_totals = (0) x scalar @candidates;
+  my @candidate_file_counts = (0) x scalar @candidates;
+
+  my @forbidden = get_pattern_with_context('forbidden_path');
+  my @forbidden_totals = (0) x scalar @forbidden;
 
   my @delayed_warnings;
-  %letter_map = ();
+  our %letter_map = ();
+
+  my %file_map = ();
 
   for my $directory (<>) {
     chomp $directory;
@@ -130,19 +320,43 @@ sub main {
     my $file=<NAME>;
     close NAME;
 
+    $file_map{$file} = $directory;
+  }
+
+  for my $file (sort keys %file_map) {
+    my $directory = $file_map{$file};
+    if ($timing_report) {
+      $start_time = (stat "$directory/name")[9];
+    }
+
     if (-e "$directory/skipped") {
       open SKIPPED, '<:utf8', "$directory/skipped";
       my $reason=<SKIPPED>;
       close SKIPPED;
       chomp $reason;
-      push @delayed_warnings, "$file: line 1, columns 1-1, Warning - Skipping `$file` because $reason\n";
-      print SHOULD_EXCLUDE "$file\n";
+      push @delayed_warnings, "$file:1:1 ... 1, Warning - Skipping `$file` because $reason\n";
+      print SHOULD_EXCLUDE "$file\n" unless $file eq $file_list;
       push @cleanup_directories, $directory;
+      report_timing($file, $start_time, $directory, 'skipped') if ($timing_report);
       next;
     }
 
-    # stats isn't written if all words in the file are in the dictionary
-    next unless (-s "$directory/stats");
+    # stats isn't written if there was nothing interesting in the file
+    unless (-s "$directory/stats") {
+      push @directories, $directory;
+      report_timing($file, $start_time, $directory, 'warnings') if ($timing_report);
+      next;
+    }
+
+    if ($file eq $file_list) {
+      open FILE_LIST, '<:utf8', $file_list;
+      push @check_file_paths, '0 placeholder';
+      for my $check_file_path (<FILE_LIST>) {
+        chomp $check_file_path;
+        push @check_file_paths, $check_file_path;
+      }
+      close FILE_LIST;
+    }
 
     my ($words, $unrecognized, $unknown, $unique);
 
@@ -154,33 +368,64 @@ sub main {
       $unrecognized=get_field($stats, 'unrecognized');
       $unknown=get_field($stats, 'unknown');
       $unique=get_field($stats, 'unique');
-      #print STDERR "$file (unrecognized: $unrecognized; unique: $unique; unknown: $unknown, words: $words)\n";
+      my @candidate_list;
+      if (@candidate_totals) {
+        @candidate_list=get_array($stats, 'candidates');
+        my @lines=get_array($stats, 'candidate_lines');
+        if (@candidate_list) {
+          for (my $i=0; $i < scalar @candidate_list; $i++) {
+            my $hits = $candidate_list[$i];
+            if ($hits) {
+              $candidate_totals[$i] += $hits;
+              if ($candidate_file_counts[$i]++ < $candidate_example_limit) {
+                my $pattern = (split /\n/,$candidates[$i])[-1];
+                my $position = $lines[$i];
+                $position =~ s/:(\d+)$/ ... $1/;
+                push @delayed_warnings, "$file:$position, Notice - `Line` matches candidate pattern `$pattern` (candidate-pattern)\n";
+              }
+            }
+          }
+        }
+      }
+      if (@forbidden_totals) {
+        @forbidden_list=get_array($stats, 'forbidden');
+        my @lines=get_array($stats, 'forbidden_lines');
+        if (@forbidden_list) {
+          for (my $i=0; $i < scalar @forbidden_list; $i++) {
+            my $hits = $forbidden_list[$i];
+            if ($hits) {
+              $forbidden_totals[$i] += $hits;
+            }
+          }
+        }
+      }
+      #print STDERR "$file (unrecognized: $unrecognized; unique: $unique; unknown: $unknown, words: $words, candidates: [".join(", ", @candidate_list)."])\n";
     }
 
+    report_timing($file, $start_time, $directory, 'unknown') if ($timing_report);
     # These heuristics are very new and need tuning/feedback
     if (
         ($unknown > $unique)
         # || ($unrecognized > $words / 2)
     ) {
-      push @delayed_warnings, "$file: line 1, columns 1-1, Warning - Skipping `$file` because there seems to be more noise ($unknown) than unique words ($unique) (total: $unrecognized / $words). (noisy-file)\n";
-      print SHOULD_EXCLUDE "$file\n";
-      push @cleanup_directories, $directory;
-      next;
+      unless ($disable_noisy_file) {
+        push @delayed_warnings, "$file:1:1 ... 1, Warning - Skipping `$file` because there seems to be more noise ($unknown) than unique words ($unique) (total: $unrecognized / $words). (noisy-file)\n";
+        if ($file ne $file_list) {
+          print SHOULD_EXCLUDE "$file\n";
+        }
+        push @directories, $directory;
+        next;
+      }
     }
     unless (-s "$directory/unknown") {
-      push @cleanup_directories, $directory;
+      push @directories, $directory;
       next;
     }
     open UNKNOWN, '<:utf8', "$directory/unknown";
     for $token (<UNKNOWN>) {
       $token =~ s/\R//;
-      $token =~ s/^[^Ii]?'+(.*)/$1/;
-      $token =~ s/(.*?)'+$/$1/;
       next unless $token =~ /./;
-      my $key = lc $token;
-      $key =~ s/''+/'/g;
-      $key =~ s/'[sd]$//;
-      my $char = substr $key, 0, 1;
+      my ($key, $char) = collate_key $token;
       $letter_map{$char} = () unless defined $letter_map{$char};
       my %word_map = ();
       %word_map = %{$letter_map{$char}{$key}} if defined $letter_map{$char}{$key};
@@ -191,10 +436,43 @@ sub main {
     push @directories, $directory;
   }
   close SHOULD_EXCLUDE;
+  close TIMING_REPORT if $timing_report;
+
+  summarize_totals(
+    sub {
+      my ($hits, $files, $context, $pattern) = @_;
+      return "# hit-count: $hits$files\n$context$pattern\n\n",
+    },
+    CheckSpelling::Util::get_file_from_env('candidate_summary', '/dev/stderr'),
+    \@candidates,
+    \@candidate_totals,
+    \@candidate_file_counts,
+  );
+
+  summarize_totals(
+    sub {
+      my (undef, undef, $context, $pattern) = @_;
+      $context =~ s/^# //gm;
+      chomp $context;
+      my $details;
+      if ($context =~ /^(.*?)$(.*)/ms) {
+        ($context, $details) = ($1, $2);
+        $details = "\n$details" if $details;
+      }
+      $context = 'Pattern' unless $context;
+      return "#### $context$details\n```\n$pattern\n```\n\n";
+    },
+    CheckSpelling::Util::get_file_from_env('forbidden_summary', '/dev/stderr'),
+    \@forbidden,
+    \@forbidden_totals,
+  );
+
+  group_related_words;
 
   if (defined $ENV{'expect'}) {
     $ENV{'expect'} =~ /(.*)/;
     load_expect $1;
+    harmonize_expect;
   }
 
   my %seen = ();
@@ -217,27 +495,33 @@ sub main {
     next unless open(NAME, '<:utf8', "$directory/name");
     my $file=<NAME>;
     close NAME;
+    my $is_file_list = $file eq $file_list;
     open WARNINGS, '<:utf8', "$directory/warnings";
-    for $warning (<WARNINGS>) {
-      chomp $warning;
-      if ($warning =~ s/(line \d+) cols (\d+-\d+): '(.*)'/$1, columns $2, Warning - `$3` is not a recognized word. (unrecognized-spelling)/) {
-        my ($line, $range, $item) = ($1, $2, $3);
-        next if skip_item($item);
-        my $seen_count = $seen{$item};
-        if (defined $seen_count) {
-          if (!defined $unknown_word_limit || ($seen_count++ < $unknown_word_limit)) {
-            print MORE_WARNINGS "$file: $warning\n"
-          } else {
-            $last_seen{$item} = "$file: $warning";
+    if (!$is_file_list) {
+      for $warning (<WARNINGS>) {
+        chomp $warning;
+        if ($warning =~ s/:(\d+):(\d+ \.\.\. \d+): '(.*)'/:$1:$2, Warning - `$3` is not a recognized word\. \(unrecognized-spelling\)/) {
+          my ($line, $range, $item) = ($1, $2, $3);
+          next if log_skip_item($item, $file, $warning, $unknown_word_limit);
+        } else {
+          if ($warning =~ /\`(.*?)\` in line\. \(token-is-substring\)/) {
+            next if skip_item($1);
           }
-          $seen{$item} = $seen_count;
-          next;
+          count_warning $warning;
         }
-        $seen{$item} = 1;
-      } else {
+        print WARNING_OUTPUT "$file$warning\n";
+      }
+    } else {
+      for $warning (<WARNINGS>) {
+        chomp $warning;
+        next unless $warning =~ s/^:(\d+)/:1/;
+        $file = $check_file_paths[$1];
+        if ($warning =~ s/:(\d+ \.\.\. \d+): '(.*)'/:$1, Warning - `$2` is not a recognized word\. \(check-file-path\)/) {
+          next if skip_item($2);
+        }
+        print WARNING_OUTPUT "$file$warning\n";
         count_warning $warning;
       }
-      print WARNING_OUTPUT "$file: $warning\n";
     }
     close WARNINGS;
   }
@@ -270,34 +554,9 @@ sub main {
   }
   close COUNTER_SUMMARY;
 
-  # group related words
-  for my $char (sort keys %letter_map) {
-    for my $plural_key (sort keys(%{$letter_map{$char}})) {
-      my $key = $plural_key;
-      if ($key =~ /.s$/) {
-        if ($key =~ /ies$/) {
-          $key =~ s/ies$/y/;
-        } else {
-          $key =~ s/s$//;
-        }
-      } elsif ($key =~ /.[^aeiou]ed$/) {
-        $key =~ s/ed$//;
-      } else {
-        next;
-      }
-      next unless defined $letter_map{$char}{$key};
-      my %word_map = %{$letter_map{$char}{$key}};
-      for $word (keys(%{$letter_map{$char}{$plural_key}})) {
-        $word_map{$word} = 1;
-      }
-      $letter_map{$char}{$key} = \%word_map;
-      delete $letter_map{$char}{$plural_key};
-    }
-  }
-
   # display the current unknown
   for my $char (sort keys %letter_map) {
-    for $key (sort keys(%{$letter_map{$char}})) {
+    for $key (sort CheckSpelling::Util::case_biased keys(%{$letter_map{$char}})) {
       my %word_map = %{$letter_map{$char}{$key}};
       my @words = keys(%word_map);
       if (scalar(@words) > 1) {

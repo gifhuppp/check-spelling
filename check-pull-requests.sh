@@ -1,7 +1,7 @@
 #!/bin/bash
 
 . "$spellchecker/common.sh"
-if [ $(uname) = "Linux" ]; then
+if [ "$(uname)" = "Linux" ]; then
   date_to_epoch() {
     date -u -d "$1" +'%s'
   }
@@ -11,19 +11,28 @@ else
   }
 fi
 timeframe=${timeframe:-60}
-time_limit=$(( $timeframe * 60 ))
+time_limit="$(( $timeframe * 60 ))"
 strip_quotes() {
   tr '"' ' '
 }
 
+(
+  echo '# :warning: check-spelling `on: schedule` support is deprecated'
+  echo 'See https://docs.check-spelling.dev/Breaking-change:-Dropping-support-for-on:-schedule'
+) >> "$GITHUB_STEP_SUMMARY"
+echo '::warning title=Deprecated Feature: `on: schedule`::See https://docs.check-spelling.dev/Breaking-change:-Dropping-support-for-on:-schedule'
+
 begin_group 'Retrieving open pull requests'
-pulls=$temp/pulls.json
-escaped=$temp/escaped.b64
-pull=$temp/pull.json
-fake_event=$temp/fake_event.json
-tree_config="$bucket/$project/"
-stored_config=$temp/config/
-headers=$temp/headers
+pulls="$temp/pulls.json"
+escaped="$temp/escaped.b64"
+pull="$temp/pull.json"
+fake_event="$temp/fake_event.json"
+if [ -n "$INPUT_BUCKET" ] && [ -n "$INPUT_PROJECT" ]; then
+tree_config="$INPUT_BUCKET/$INPUT_PROJECT/"
+else
+tree_config="$INPUT_CONFIG/"
+fi
+stored_config="$temp/config/"
 
 Q='"'
 
@@ -32,7 +41,7 @@ repo=${GITHUB_REPOSITORY#*/}
 length=20
 
 get_open_pulls() {
-query=$(echo "query {
+echo "query {
   repository(owner:${Q}$owner${Q} name:${Q}$repo${Q}) {
     pullRequests(first: $length states: OPEN $continue) {
       totalCount
@@ -67,30 +76,29 @@ query=$(echo "query {
       }
     }
   }
-}")
-echo '{}' | jq --arg query "$query" '.query = $query'
+}"
 }
 
 if [ -e "$pulls.nodes" ]; then
-  echo using cached $pulls.nodes
+  echo "using cached $pulls.nodes"
 else
   rm -f "$pulls.nodes"
   touch "$pulls.nodes"
   while :
   do
-    curl -s -H "Authorization: token $GITHUB_TOKEN" --header "Content-Type: application/json" --data-binary "$(get_open_pulls)" $GITHUB_GRAPHQL_URL > $pulls
-    cat "$pulls" | jq .data.repository.pullRequests > "$pulls.pull_requests"
-    cat "$pulls.pull_requests" | jq -c '.nodes[]' >> "$pulls.nodes"
-    cat "$pulls.pull_requests" | jq .pageInfo > "$pulls.page_info"
-    if [ "$(cat "$pulls.page_info" | jq -c -r .hasNextPage)" != "true" ]; then
+    gh api graphql -f query="$(get_open_pulls)" > "$pulls"
+    jq .data.repository.pullRequests "$pulls" > "$pulls.pull_requests"
+    jq -c 'try .nodes[]' "$pulls.pull_requests" >> "$pulls.nodes"
+    jq .pageInfo "$pulls.pull_requests" > "$pulls.page_info"
+    if [ "$(jq -c -r .hasNextPage "$pulls.page_info")" != "true" ]; then
       continue=''
       break
     fi
-    continue="after: ${Q}$(cat "$pulls.page_info"|jq -c -r .endCursor)${Q}"
+    continue="after: ${Q}$(jq -c -r .endCursor "$pulls.page_info")${Q}"
   done
 fi
 
-cat "$pulls.nodes" |jq -c -r '{
+jq -c -r '{
  head_repo: .headRepository.nameWithOwner,
  base_repo: .baseRepository.nameWithOwner,
  head_ref: .headRefName,
@@ -103,7 +111,7 @@ cat "$pulls.nodes" |jq -c -r '{
  issue_url: .url | sub("github.com"; "api.github.com/repos") | sub("/pull/(?<id>[0-9]+)$"; "/issues/\(.id)"),
  commits_url: .url | sub("github.com"; "api.github.com/repos") | sub("/pull/(?<id>[0-9]+)$"; "/pulls/\(.id)/commits"),
  comments_url: .url | sub("github.com"; "api.github.com/repos") | sub("/pull/(?<id>[0-9]+)$"; "/issues/\(.id)/comments"),
- } | @base64' > "$escaped"
+ } | @base64' "$pulls.nodes" > "$escaped"
 if [ -s "$escaped" ]; then
   if [ -d "$tree_config" ]; then
     mkdir -p "$stored_config"
@@ -113,32 +121,31 @@ fi
 end_group
 
 for a in $(cat "$escaped"); do
-  echo "$a" | base64 --decode | jq -r . > $pull
-  url=$(cat $pull | jq -r .commits_url | perl -pe 's{://api.github.com/repos/(.*/pull)s}{://github.com/$1}')
-  issue_url=$(cat $pull | jq -r .issue_url)
+  echo "$a" | base64 --decode | jq -r . > "$pull"
+  url="$(jq -r .commits_url "$pull" | perl -pe 's{://api.github.com/repos/(.*/pull)s}{://github.com/$1}')"
   begin_group "Considering $url"
-  created_at=$(cat $pull | jq -r '.updated_at // .created_at')
-  created_at=$(date_to_epoch $created_at)
-  age=$(( $start / 1000000000 - $created_at ))
-  if [ $age -gt $time_limit ]; then
+  created_at="$(jq -r '.updated_at // .created_at' "$pull")"
+  created_at="$(date_to_epoch "$created_at")"
+  age="$(( $start / 1000000000 - $created_at ))"
+  if [ "$age" -gt "$time_limit" ]; then
     end_group
     continue
   fi
-  head_repo=$(cat $pull | jq -r .head_repo)
-  base_repo=$(cat $pull | jq -r .base_repo)
+  head_repo="$(jq -r .head_repo "$pull")"
+  base_repo="$(jq -r .base_repo "$pull")"
   if [ "$head_repo" = "$base_repo" ]; then
     end_group
     continue
   fi
-  head_sha=$(cat $pull | jq -r .head_sha)
-  base_sha=$(cat $pull | jq -r .base_sha)
-  merge_commit_sha=$(cat $pull | jq -r .merge_commit_sha)
-  comments_url=$(cat $pull | jq -r .comments_url)
-  commits_url=$(cat $pull | jq -r .commits_url)
-  clone_url=$(cat $pull | jq -r .clone_url)
-  clone_url=$(echo "$clone_url" | sed -e 's/https/http/')
-  head_ref=$(cat $pull | jq -r .head_ref)
-  echo "do work for $head_repo -> $base_repo: $head_sha as $merge_commit_sha"
+  head_sha="$(jq -r .head_sha "$pull")"
+  base_sha="$(jq -r .base_sha "$pull")"
+  merge_commit_sha="$(jq -r '.merge_commit_sha // empty' "$pull")"
+  comments_url="$(jq -r .comments_url "$pull")"
+  commits_url="$(jq -r .commits_url "$pull")"
+  clone_url="$(jq -r .clone_url "$pull")"
+  clone_url="${clone_url//https:/http:}"
+  head_ref="$(jq -r .head_ref "$pull")"
+  echo "do work for $head_repo -> $base_repo: $head_sha as ${merge_commit_sha:-(merge commit not available)}"
   export GITHUB_SHA="$head_sha"
   export GITHUB_EVENT_NAME=pull_request
   echo '{}' | jq \
@@ -150,19 +157,20 @@ for a in $(cat "$escaped"); do
     > "$fake_event"
   export GITHUB_EVENT_PATH="$fake_event"
   git remote rm pr 2>/dev/null || true
-  git remote add pr $clone_url
+  git remote add pr "$clone_url"
   cat .git/config
-  git fetch pr $head_ref
-  git checkout $head_sha
+  git fetch pr "$head_ref"
+  git checkout "$head_sha"
   git remote rm pr 2>/dev/null || true
   end_group
   (
-    temp=$(mktemp -d)
+    temp="$(mktemp -d)"
     if [ -d "$stored_config" ] && [ ! -d "$tree_config" ]; then
       mkdir -p "$tree_config"
       rsync -a "$stored_config" "$tree_config"
       cleanup_tree_config=1
     fi
+    export INPUT_REPORT_TITLE_SUFFIX="$head_repo: $head_ref into -> $base_repo: $base_sha"
     "$spellchecker/unknown-words.sh" || true
     rm -rf "$temp"
     if [ -n "$cleanup_tree_config" ]; then

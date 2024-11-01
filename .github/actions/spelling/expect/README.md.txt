@@ -1,12 +1,6 @@
-github
 gsutil
-http
-jsoref
-png
-ssh
-svg
+ikea
+microsoft
+spammed
 timeframe
-url
-wiki
-workflow
-www
+workflows

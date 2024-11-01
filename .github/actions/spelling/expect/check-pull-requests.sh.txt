@@ -1,14 +1,4 @@
-api
-config
-github
-GRAPHQL
-http
-json
-oid
-perl
-rsync
+graphql
 spellchecker
 timeframe
-uname
-url
 vnd

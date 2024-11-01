@@ -1,5 +1,3 @@
-cspell
-dicts
-github
-jsoref
-sudo
+cpanmin
+nektosact
+stdbuf

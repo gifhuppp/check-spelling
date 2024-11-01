@@ -1,2 +1,10 @@
+.secrets
 blib/
+Build
 cover_db/
+coverage/
+local/
+/CheckSpelling/
+MYMETA.*
+t/unknown-words/run/
+dictionaries

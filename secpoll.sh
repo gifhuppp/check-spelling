@@ -1,6 +1,12 @@
 #!/bin/sh
 set -e
 
+if [ -z "$GITHUB_ENV" ]; then
+  GITHUB_ENV=/dev/stdout
+fi
+
+echo "::add-matcher::$spellchecker/reporter-misc.json"
+
 die() {
   echo "::error ::$1"
   echo "::error ::This is a fatal error ... asking Action Host to kill our workflow"
@@ -25,19 +31,25 @@ dns_server() {
 }
 
 base_domain=check-spelling.dev
-version=$(cat "$spellchecker/version")
-version_reversed=$(echo $version|tr '.' "\n" | tac| tr "\n" '.')
-poll_status=$(dig txt +noauthority +answer +noquestion ${version_reversed}security-status.secpoll.${base_domain} $(dns_server) 2>&1 |
-perl -e 'while (<>) {
-  if (/command not found/) {
-    $poll_status = $_;
-  } elsif (/^;; ->>HEADER<<- opcode: QUERY, status: (\w+),/) {
-    $poll_status = $1;
-  } elsif (/^[^;].*"(.*)"$/) {
-    $poll_status = $1;
+version=$(cat "$THIS_ACTION_PATH/version")
+version_reversed=$(echo "$version"|tr '.' "\n" | tac | tr "\n" '.')
+dns_server_cached=$(dns_server)
+
+lookup() {
+  dig txt +noauthority +answer +noquestion "$1" $dns_server_cached 2>&1 |
+  perl -e 'while (<>) {
+    if (/command not found/) {
+      $poll_status = $_;
+    } elsif (/^;; ->>HEADER<<- opcode: QUERY, status: (\w+),/) {
+      $poll_status = $1;
+    } elsif (/^[^;].*"(.*)"$/) {
+      $poll_status = $1;
+    }
   }
+  print "$poll_status\n";'
 }
-print "$poll_status\n";')
+
+poll_status=$(lookup "${version_reversed}security-status.secpoll.${base_domain}")
 
 expect_empty_advisory() {
   if [ -n "$INPUT_IGNORE_SECURITY_ADVISORY" ]; then
@@ -75,3 +87,33 @@ case "$poll_status" in
     echo "::warning ::Found note for version $version: '$poll_status'" >&2
   ;;
 esac
+
+for action_file in $(find "$spellchecker/actions/" -type f -name action.yml); do
+  for fallback_action in $(
+    perl -ne 'next unless m{uses: (github|actions)/([^/]*)(?:/[^@]*|)\@(\S+)}; print "$3.$1-$2\n"' $action_file |sort -u
+  ); do
+    response=$(lookup "$fallback_action.flaky-action.$base_domain")
+    case "$response" in
+    *"command not found")
+      echo 'assume?' > /dev/null
+    ;;
+    "")
+      echo 'assume good?' > /dev/null
+    ;;
+    "1 "*)
+      echo 'known good!' > /dev/null
+    ;;
+    "2 "*)
+      echo 'known stale :(' > /dev/null
+    ;;
+    "3 "*)
+      echo 'known very bad!' > /dev/null
+    ;;
+    "4 "*)
+      echo 'known broken -- we can handle this' > /dev/null
+      action="$fallback_action" perl -e 'my $action=$ENV{action}; $action =~ s/[-.]/_/g; print "replace_$action=1\n"' >> "$GITHUB_ENV"
+      perl -pi -e 's%uses:\s+([^/]+)/%uses: check-spelling/$1-%' "$action_file"
+    ;;
+    esac
+  done
+done

@@ -1,12 +1,13 @@
-#!/usr/bin/perl -wT -Ilib
+#!/usr/bin/env -S perl -T -Ilib
 
 use strict;
+use warnings;
 
 use File::Temp qw/ tempfile tempdir /;
-use IO::Capture::Stderr;
+use Capture::Tiny ':all';
 
 use Test::More;
-plan tests => 29;
+plan tests => 34;
 
 sub fill_file {
   my ($file, $content) = @_;
@@ -34,18 +35,12 @@ sub stage_test {
 sub run_test {
   my ($directories) = @_;
   my $output = '';
-  open(my $outputFH, '>', \$output) or die; # This shouldn't fail
-  my $oldFH = select $outputFH;
-  my $capture = IO::Capture::Stderr->new();
-  $capture->start();
-  {
+  my ($stdout, $stderr, @result) = capture {
     open my $fh, "<", \$directories;
     local *ARGV = $fh;
     CheckSpelling::SpellingCollator::main();
-  }
-  $capture->stop();
-  select $oldFH;
-  return ($output, (join "\n", $capture->read()));
+  };
+  return ($stdout, $stderr);
 }
 
 sub read_file {
@@ -67,16 +62,20 @@ sub check_output_file {
 
 use_ok('CheckSpelling::SpellingCollator');
 
-my ($fh, $early_warnings, $warning_output, $more_warnings, $counter_summary);
+my ($fh, $early_warnings, $warning_output, $more_warnings, $counter_summary, $forbidden_patterns, $forbidden_summary);
 
 ($fh, $early_warnings) = tempfile;
 ($fh, $warning_output) = tempfile;
 ($fh, $more_warnings) = tempfile;
 ($fh, $counter_summary) = tempfile;
+($fh, $forbidden_patterns) = tempfile;
+($fh, $forbidden_summary) = tempfile;
 $ENV{'early_warnings'} = $early_warnings;
 $ENV{'warning_output'} = $warning_output;
 $ENV{'more_warnings'} = $more_warnings;
 $ENV{'counter_summary'} = $counter_summary;
+$ENV{'forbidden_path'} = $forbidden_patterns;
+$ENV{'forbidden_summary'} = $forbidden_summary;
 
 my $directory = stage_test('empty.txt', '', '', '', '');
 run_test($directory);
@@ -112,11 +111,10 @@ my $directories = "$directory
 fill_file($early_warnings, "goose (animal)\n");
 my ($output, $error_lines) = run_test($directories);
 is($error_lines, 'Not a directory: /dev/null
-
 Could not find: /dev/no-such-dev
 ');
 check_output_file($warning_output, 'goose (animal)
-hello.txt: line 1, columns 1-1, Warning - Skipping `hello.txt` because blah (skipped)
+hello.txt:1:1 ... 1, Warning - Skipping `hello.txt` because blah (skipped)
 ');
 check_output_file($counter_summary, '{
 "animal": 1
@@ -126,13 +124,13 @@ check_output_file($counter_summary, '{
 check_output_file($more_warnings, '');
 
 my $file_name='test.txt';
-$directory = stage_test($file_name, '{words: 3, unrecognized: 2, unknown: 2, unique: 2}', '', "line 2 cols 3-8: 'something'
-line 3 cols 3-5: 'Foo'
-line 4 cols 3-6: 'foos'
-line 5 cols 7-9: 'foo'
-line 6 cols 3-9: 'fooies'
-line 6 cols 3-9: 'fozed'
-line 10 cols 4-10: 'something'", "xxxpaz
+$directory = stage_test($file_name, '{words: 3, unrecognized: 2, unknown: 2, unique: 2}', '', ":2:3 ... 8: 'something'
+:3:3 ... 5: 'Foo'
+:4:3 ... 6: 'foos'
+:5:7 ... 9: 'foo'
+:6:3 ... 9: 'fooies'
+:6:3 ... 9: 'fozed'
+:10:4 ... 10: 'something'", "xxxpaz
 xxxpazs
 jjjjjy
 jjjjjies
@@ -147,10 +145,10 @@ nnnnnnnnns
 xxxpaz (xxxpaz, xxxpazs)
 ");
 is($error_lines, '');
-check_output_file($warning_output, "$file_name: line 2, columns 3-8, Warning - `something` is not a recognized word. (unrecognized-spelling)
-");
+check_output_file($warning_output, q<test.txt:2:3 ... 8, Warning - `something` is not a recognized word. (unrecognized-spelling)
+>);
 check_output_file($counter_summary, '');
-check_output_file($more_warnings, 'test.txt: line 10, columns 4-10, Warning - `something` is not a recognized word. (unrecognized-spelling)
+check_output_file($more_warnings, 'test.txt:10:4 ... 10, Warning - `something` is not a recognized word. (unrecognized-spelling)
 ');
 fill_file($expect, "
 AAA
@@ -158,7 +156,7 @@ Bbb
 ccc
 DDD
 Eee
-fff
+Fff
 GGG
 Hhh
 iii
@@ -176,17 +174,18 @@ Ddd
 ddd
 Eee
 eee
-Fff
-fff
+FFF
 GGG
 Ggg
 HHH
 Hhh
 III
 Iii
+Jjj
+lll
 );
 $directory = stage_test('case.txt', '{words: 1000, unique: 1000}', '',
-(join "\n", map { "line 1 cols 1-1: '$_'" } @word_variants),
+(join "\n", map { ":1:1 ... 1: '$_'" } @word_variants),
 (join "\n", @word_variants));
 ($output, $error_lines) = run_test($directory);
 is($output, "aaa (AAA, Aaa, aaa)
@@ -194,19 +193,24 @@ bbb (BBB, Bbb, bbb)
 ccc (CCC, Ccc, ccc)
 ddd (Ddd, ddd)
 eee (Eee, eee)
-fff (Fff, fff)
+FFF
 ggg (GGG, Ggg)
 hhh (HHH, Hhh)
 iii (III, Iii)
+Jjj
+lll
 ");
 is($error_lines, '');
-check_output_file($warning_output, q<case.txt: line 1, columns 1-1, Warning - `Aaa` is not a recognized word. (unrecognized-spelling)
-case.txt: line 1, columns 1-1, Warning - `aaa` is not a recognized word. (unrecognized-spelling)
-case.txt: line 1, columns 1-1, Warning - `bbb` is not a recognized word. (unrecognized-spelling)
-case.txt: line 1, columns 1-1, Warning - `Ddd` is not a recognized word. (unrecognized-spelling)
-case.txt: line 1, columns 1-1, Warning - `ddd` is not a recognized word. (unrecognized-spelling)
-case.txt: line 1, columns 1-1, Warning - `eee` is not a recognized word. (unrecognized-spelling)
-case.txt: line 1, columns 1-1, Warning - `Ggg` is not a recognized word. (unrecognized-spelling)
+check_output_file($warning_output, q<case.txt:1:1 ... 1, Warning - `Aaa` is not a recognized word. (unrecognized-spelling)
+case.txt:1:1 ... 1, Warning - `aaa` is not a recognized word. (unrecognized-spelling)
+case.txt:1:1 ... 1, Warning - `bbb` is not a recognized word. (unrecognized-spelling)
+case.txt:1:1 ... 1, Warning - `Ddd` is not a recognized word. (unrecognized-spelling)
+case.txt:1:1 ... 1, Warning - `ddd` is not a recognized word. (unrecognized-spelling)
+case.txt:1:1 ... 1, Warning - `eee` is not a recognized word. (unrecognized-spelling)
+case.txt:1:1 ... 1, Warning - `FFF` is not a recognized word. (unrecognized-spelling)
+case.txt:1:1 ... 1, Warning - `Ggg` is not a recognized word. (unrecognized-spelling)
+case.txt:1:1 ... 1, Warning - `Jjj` is not a recognized word. (unrecognized-spelling)
+case.txt:1:1 ... 1, Warning - `lll` is not a recognized word. (unrecognized-spelling)
 >);
 check_output_file($counter_summary, '');
 check_output_file($more_warnings, '');
@@ -216,11 +220,11 @@ alloc
 malloc
 >);
 
-$directory = stage_test('punctuation.txt', '{words: 1000, unique: 1000}', '', "line 1 cols 1-1: 'calloc'
-line 1 cols 1-1: 'calloc'd'
-line 1 cols 1-1: 'a'calloc'
-line 1 cols 1-1: 'malloc'
-line 1 cols 1-1: 'malloc'd'
+$directory = stage_test('punctuation.txt', '{words: 1000, unique: 1000}', '', ":1:1 ... 1: 'calloc'
+:1:1 ... 1: 'calloc'd'
+:1:1 ... 1: 'a'calloc'
+:1:1 ... 1: 'malloc'
+:1:1 ... 1: 'malloc'd'
 ", q<
 calloc
 calloc'd
@@ -229,11 +233,65 @@ malloc
 malloc'd
 >);
 ($output, $error_lines) = run_test($directory);
-is($output, "calloc (calloc, calloc'd)
+is($output, "calloc (calloc, a'calloc, calloc'd)
 malloc (malloc, malloc'd)
 ");
 is($error_lines, '');
-check_output_file($warning_output, q<punctuation.txt: line 1, columns 1-1, Warning - `a'calloc` is not a recognized word. (unrecognized-spelling)
+check_output_file($warning_output, q<punctuation.txt:1:1 ... 1, Warning - `a'calloc` is not a recognized word. (unrecognized-spelling)
 >);
 check_output_file($counter_summary, '');
 check_output_file($more_warnings, '');
+
+my $file_names;
+($fh, $file_names) = tempfile;
+print $fh 'apple
+pear';
+close $fh;
+fill_file($forbidden_patterns, '# please avoid starting lines with "pe" followed by a letter.
+^pe.
+');
+$directory = stage_test($file_names, '{forbidden: [1], forbidden_lines: [2:1:3]}}', '', ":1:1 ... 5: 'apple'
+:2:1 ... 4: 'pear'
+:2:1 ... 3, Warning - `pea` matches a line_forbidden.patterns entry: `^pe.`. (forbidden-pattern)
+", 'apple
+pear');
+$ENV{'check_file_names'} = $file_names;
+($output, $error_lines) = run_test($directory);
+delete $ENV{'check_file_names'};
+check_output_file($counter_summary, '{
+"check-file-path": 2
+,"forbidden-pattern": 1
+}
+');
+check_output_file($forbidden_summary, '#### please avoid starting lines with "pe" followed by a letter.
+```
+^pe.
+```
+
+');
+check_output_file($warning_output, 'apple:1:1 ... 5, Warning - `apple` is not a recognized word. (check-file-path)
+pear:1:1 ... 4, Warning - `pear` is not a recognized word. (check-file-path)
+pear:1:1 ... 3, Warning - `pea` matches a line_forbidden.patterns entry: `^pe.`. (forbidden-pattern)
+');
+truncate($forbidden_patterns, 0);
+
+($fh, $file_names) = tempfile;
+print $fh 'apple
+apple
+apple
+pear';
+close $fh;
+$directory = stage_test($file_names, '{words: 3, unrecognized: 2, unknown: 2, unique: 2}', '', "
+:1:1 ... 4: 'apple'
+:2:1 ... 4: 'apple'
+:3:1 ... 4: 'apple'
+:4:1 ... 4: 'apple'
+");
+$ENV{'unknown_word_limit'} = 3;
+($output, $error_lines) = run_test($directory);
+check_output_file($warning_output, "$file_names
+$file_names:1:1 ... 4, Warning - `apple` is not a recognized word. (unrecognized-spelling)
+");
+check_output_file($more_warnings, "$file_names:2:1 ... 4, Warning - `apple` is not a recognized word. (unrecognized-spelling)
+$file_names:3:1 ... 4, Warning - `apple` is not a recognized word. (unrecognized-spelling)
+");
